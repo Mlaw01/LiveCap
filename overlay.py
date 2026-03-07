@@ -13,14 +13,16 @@ import pyaudiowpatch as pa
 from deepgram import DeepgramClient
 from deepgram.listen.v1.types.listen_v1results import ListenV1Results
 from PyQt6.QtCore import QThread, QTimer, Qt, pyqtSignal
-from PyQt6.QtGui import QGuiApplication, QKeySequence, QShortcut
+from PyQt6.QtGui import QAction, QActionGroup, QGuiApplication, QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
     QHBoxLayout,
     QLabel,
+    QMenu,
     QPlainTextEdit,
     QPushButton,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -37,6 +39,7 @@ TARGET_LANG = "ZH-HANS"
 MAX_RUN_MINUTES = 30
 
 
+# Convert captured PCM audio to mono + target sample rate for Deepgram.
 def downmix_and_resample_linear16(
     in_bytes: bytes, in_channels: int, in_rate: int, out_rate: int
 ) -> bytes:
@@ -56,6 +59,7 @@ def downmix_and_resample_linear16(
     return np.clip(audio, -32768, 32767).astype(np.int16).tobytes()
 
 
+# Resolve the default Windows speaker loopback device (desktop audio capture source).
 def resolve_default_loopback_device(p: pa.PyAudio) -> dict:
     wasapi_info = p.get_host_api_info_by_type(pa.paWASAPI)
     default_out = p.get_device_info_by_index(wasapi_info["defaultOutputDevice"])
@@ -65,14 +69,20 @@ def resolve_default_loopback_device(p: pa.PyAudio) -> dict:
     return p.get_default_wasapi_loopback()
 
 
+def list_loopback_devices(p: pa.PyAudio) -> list[dict]:
+    return list(p.get_loopback_device_info_generator())
+
+
+# Background worker: captures desktop audio, streams to Deepgram, translates finals with DeepL.
 class StreamWorker(QThread):
     caption_update = pyqtSignal(str, str, str)  # interim_en, final_en, final_zh
     status_update = pyqtSignal(str)
     error_update = pyqtSignal(str)
 
-    def __init__(self) -> None:
+    def __init__(self, device_index: int | None = None) -> None:
         super().__init__()
         self._stop_flag = threading.Event()
+        self._device_index = device_index
 
     def stop(self) -> None:
         self._stop_flag.set()
@@ -83,6 +93,7 @@ class StreamWorker(QThread):
         except Exception as exc:
             self.error_update.emit(str(exc))
 
+    # Main streaming loop: audio capture + STT receive + translation emit.
     def _run_sync(self) -> None:
         if load_dotenv is not None:
             load_dotenv(dotenv_path=Path(__file__).with_name(".env"))
@@ -101,7 +112,10 @@ class StreamWorker(QThread):
         stream = None
         receiver_thread = None
         try:
-            device = resolve_default_loopback_device(p)
+            if self._device_index is None:
+                device = resolve_default_loopback_device(p)
+            else:
+                device = p.get_device_info_by_index(self._device_index)
             in_channels = int(device["maxInputChannels"])
             in_rate = int(device["defaultSampleRate"])
             self.status_update.emit(
@@ -117,6 +131,7 @@ class StreamWorker(QThread):
                 sample_rate=str(TARGET_SAMPLE_RATE),
                 interim_results="true" if INTERIM_RESULTS else "false",
             ) as dg_connection:
+                # Open loopback capture stream for system/output audio.
                 stream = p.open(
                     format=pa.paInt16,
                     channels=in_channels,
@@ -129,6 +144,7 @@ class StreamWorker(QThread):
 
                 last_interim = ""
 
+                # Receiver thread: consumes Deepgram events and emits interim/final captions.
                 def receiver() -> None:
                     nonlocal last_interim
                     for message in dg_connection:
@@ -155,6 +171,7 @@ class StreamWorker(QThread):
                 receiver_thread = threading.Thread(target=receiver, daemon=True)
                 receiver_thread.start()
 
+                # Sender loop: reads desktop audio frames and sends processed PCM to Deepgram.
                 while not self._stop_flag.is_set():
                     available = 0
                     with contextlib.suppress(Exception):
@@ -187,6 +204,7 @@ class StreamWorker(QThread):
             self.status_update.emit("Stopped")
 
 
+# Main overlay window: controls, caption display, transcript history, and runtime safety timers.
 class CaptionOverlay(QWidget):
     def __init__(self) -> None:
         super().__init__()
@@ -201,8 +219,11 @@ class CaptionOverlay(QWidget):
         self.countdown_timer.timeout.connect(self.update_countdown_label)
         self.session_end_monotonic: float | None = None
         self.auto_stopped = False
+        self.loopback_devices: list[dict] = []
+        self.selected_device_index: int | None = None
         self._build_ui()
         self._position_bottom_center()
+        self.refresh_devices()
 
     def _build_ui(self) -> None:
         self.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
@@ -230,6 +251,15 @@ class CaptionOverlay(QWidget):
         self.stop_button.setEnabled(False)
         self.clear_button = QPushButton("Clear")
         self.clear_button.clicked.connect(self.clear_labels)
+        self.device_button = QToolButton()
+        self.device_button.setText("Device")
+        self.device_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.device_menu = QMenu(self.device_button)
+        self.device_button.setMenu(self.device_menu)
+        self.device_actions = QActionGroup(self)
+        self.device_actions.setExclusive(True)
+        self.refresh_button = QPushButton("Refresh devices")
+        self.refresh_button.clicked.connect(self.refresh_devices)
         self.always_on_top_checkbox = QCheckBox("Always on top")
         self.always_on_top_checkbox.setChecked(True)
         self.always_on_top_checkbox.stateChanged.connect(self.toggle_always_on_top)
@@ -241,6 +271,8 @@ class CaptionOverlay(QWidget):
         controls.addWidget(self.start_button)
         controls.addWidget(self.stop_button)
         controls.addWidget(self.clear_button)
+        controls.addWidget(self.device_button)
+        controls.addWidget(self.refresh_button)
         controls.addWidget(self.always_on_top_checkbox)
         controls.addWidget(self.countdown_label)
         controls.addWidget(self.status_label, 1)
@@ -248,7 +280,7 @@ class CaptionOverlay(QWidget):
         self.en_label = QLabel("Waiting for audio...")
         self.en_label.setWordWrap(True)
         self.en_label.setStyleSheet(
-            "color: #F4F4F4; font-size: 24px; font-weight: 700;"
+            "color: #F4F4F4; font-size: 18px; font-weight: 700;"
             "background-color: rgba(25, 25, 25, 210); border: 1px solid #303030;"
             "border-radius: 10px; padding: 10px 14px;"
         )
@@ -256,7 +288,7 @@ class CaptionOverlay(QWidget):
         self.zh_label = QLabel("Waiting for translation...")
         self.zh_label.setWordWrap(True)
         self.zh_label.setStyleSheet(
-            "color: #89F0A4; font-size: 30px; font-weight: 700;"
+            "color: #89F0A4; font-size: 20px; font-weight: 700;"
             "background-color: rgba(20, 20, 20, 220); border: 1px solid #2A2A2A;"
             "border-radius: 10px; padding: 10px 14px;"
         )
@@ -265,7 +297,7 @@ class CaptionOverlay(QWidget):
         self.history_box.setReadOnly(True)
         self.history_box.setPlaceholderText("Transcript history will appear here...")
         self.history_box.setStyleSheet(
-            "color: #DADADA; font-size: 13px; background-color: #101010; "
+            "color: #DADADA; font-size: 15px; background-color: #101010; "
             "border: 1px solid #2B2B2B; border-radius: 8px; padding: 8px;"
         )
         self.history_box.setMinimumHeight(180)
@@ -294,7 +326,8 @@ class CaptionOverlay(QWidget):
         if self.worker is not None and self.worker.isRunning():
             return
         self.auto_stopped = False
-        self.worker = StreamWorker()
+        device_index = self.selected_device_index
+        self.worker = StreamWorker(device_index=device_index)
         self.worker.caption_update.connect(self.on_update_caption)
         self.worker.status_update.connect(self.on_status_update)
         self.worker.error_update.connect(self.on_error)
@@ -341,6 +374,7 @@ class CaptionOverlay(QWidget):
         self.start_button.setEnabled(True)
         self.stop_button.setEnabled(False)
 
+    # Update live caption labels and append finalized pairs to transcript history.
     def on_update_caption(self, en_interim: str, en_final: str, zh_final: str) -> None:
         if en_interim and en_interim != self._last_en_interim:
             self.en_label.setText(en_interim)
@@ -354,6 +388,7 @@ class CaptionOverlay(QWidget):
             self.zh_label.setText(zh_final)
             self._last_zh_final = zh_final
 
+    # Store timestamped finalized transcript lines for scrollback.
     def append_history(self, en_final: str, zh_final: str) -> None:
         ts = datetime.now().strftime("%H:%M:%S")
         lines = [f"[{ts}] EN: {en_final}"]
@@ -401,6 +436,80 @@ class CaptionOverlay(QWidget):
         mins = remaining // 60
         secs = remaining % 60
         self.countdown_label.setText(f"{mins:02d}:{secs:02d} left")
+
+    # Re-scan available loopback devices and rebuild the Device menu.
+    def refresh_devices(self) -> None:
+        if self.worker is not None and self.worker.isRunning():
+            self.status_label.setText("Stop streaming before refreshing devices")
+            return
+
+        previous = self.selected_device_index
+        self.device_menu.clear()
+        self.device_actions = QActionGroup(self)
+        self.device_actions.setExclusive(True)
+        self.loopback_devices = []
+
+        p = pa.PyAudio()
+        default_idx = None
+        try:
+            self.loopback_devices = list_loopback_devices(p)
+            default_idx = int(resolve_default_loopback_device(p)["index"])
+        except Exception:
+            self.loopback_devices = []
+        finally:
+            p.terminate()
+
+        for dev in self.loopback_devices:
+            label = str(dev["name"])
+            idx = int(dev["index"])
+            action = QAction(label, self.device_menu)
+            action.setCheckable(True)
+            action.setData(idx)
+            action.triggered.connect(lambda checked=False, i=idx: self.select_device(i))
+            self.device_actions.addAction(action)
+            self.device_menu.addAction(action)
+
+        select_idx = -1
+        if previous is not None:
+            prev_idx = int(previous)
+            for i, dev in enumerate(self.loopback_devices):
+                if int(dev["index"]) == prev_idx:
+                    select_idx = i
+                    break
+        if select_idx < 0 and default_idx is not None:
+            for i, dev in enumerate(self.loopback_devices):
+                if int(dev["index"]) == default_idx:
+                    select_idx = i
+                    break
+        if select_idx < 0 and len(self.loopback_devices) > 0:
+            select_idx = 0
+
+        if select_idx >= 0:
+            selected_idx = int(self.loopback_devices[select_idx]["index"])
+            self.select_device(selected_idx)
+            self.start_button.setEnabled(True)
+            self.status_label.setText("Device list refreshed")
+        else:
+            self.selected_device_index = None
+            self.device_button.setText("Device")
+            self.device_button.setEnabled(False)
+            self.start_button.setEnabled(False)
+            self.status_label.setText("No loopback devices found")
+
+    # Set active capture device and visually mark selection in the Device menu.
+    def select_device(self, device_index: int) -> None:
+        self.selected_device_index = int(device_index)
+        selected_name = "Device"
+        for action in self.device_actions.actions():
+            action_idx = int(action.data())
+            is_selected = action_idx == self.selected_device_index
+            action.setChecked(is_selected)
+            if is_selected:
+                selected_name = action.text()
+
+        self.device_button.setEnabled(True)
+        self.device_button.setText("Device")
+        self.status_label.setText(f"Selected device: {selected_name}")
 
 
 def run_demo(overlay: CaptionOverlay) -> None:
