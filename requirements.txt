@@ -1,0 +1,6 @@
+PyQt6
+deepgram-sdk
+deepl
+numpy
+python-dotenv
+pyaudiowpatch
